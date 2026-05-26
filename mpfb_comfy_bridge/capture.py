@@ -192,69 +192,17 @@ def capture_beauty_png(context, camera):
 
 def capture_depth_png(context, camera):
     scene = context.scene
-    view_layer = context.view_layer
-    old_use_nodes = scene.use_nodes
-    old_use_pass_z = view_layer.use_pass_z
-    temp_nodes = []
-    temp_links = []
-    depth_image = None
     path = _temp_png_path("depth")
     try:
-        scene.use_nodes = True
-        view_layer.use_pass_z = True
-        tree = scene.node_tree
-        if tree is None:
-            raise ValueError("Scene compositor node tree is unavailable")
-
-        render_layers = tree.nodes.new(type="CompositorNodeRLayers")
-        normalize = tree.nodes.new(type="CompositorNodeNormalize")
-        viewer = tree.nodes.new(type="CompositorNodeViewer")
-        temp_nodes.extend([render_layers, normalize, viewer])
-        render_layers.label = "MPFB Bridge Render Layers"
-        normalize.label = "MPFB Bridge Normalize Depth"
-        viewer.label = "MPFB Bridge Depth Viewer"
-
-        depth_socket = render_layers.outputs.get("Depth") or render_layers.outputs.get("Z")
-        if depth_socket is None:
-            raise ValueError("Render Layers node has no depth output")
-        temp_links.append(tree.links.new(depth_socket, normalize.inputs[0]))
-        temp_links.append(tree.links.new(normalize.outputs[0], viewer.inputs[0]))
-
         with CameraGuard(scene, camera):
-            bpy.ops.render.render(write_still=False)
-
-        viewer_image = bpy.data.images.get("Viewer Node")
-        if viewer_image is None or viewer_image.size[0] <= 0 or viewer_image.size[1] <= 0:
-            raise ValueError("Depth viewer image was not generated")
-
-        width, height = viewer_image.size
-        pixels = [0.0] * (width * height * 4)
-        viewer_image.pixels.foreach_get(pixels)
-        depth_image = bpy.data.images.new("MPFB Comfy Bridge Depth", width, height, alpha=True)
-        depth_image.pixels.foreach_set(pixels)
-        depth_image.filepath_raw = path
-        depth_image.file_format = "PNG"
-        depth_image.save()
+            pixels, metadata = _capture_depth_pixels_cpu(context, camera)
+        width, height = metadata["render_resolution"]
+        _save_rgba_png("MPFB Comfy Bridge Depth", width, height, pixels, path)
         return _read_and_remove(path), {
             "render_resolution": [width, height],
-            "depth_normalization": {"mode": "compositor_normalize"},
+            "depth_normalization": metadata["depth_normalization"],
         }
     finally:
-        if depth_image is not None:
-            bpy.data.images.remove(depth_image)
-        if scene.node_tree is not None:
-            for link in temp_links:
-                try:
-                    scene.node_tree.links.remove(link)
-                except Exception:
-                    pass
-            for node in temp_nodes:
-                try:
-                    scene.node_tree.nodes.remove(node)
-                except Exception:
-                    pass
-        view_layer.use_pass_z = old_use_pass_z
-        scene.use_nodes = old_use_nodes
         _remove_if_exists(path)
 
 
@@ -331,6 +279,148 @@ def _project_to_camera(scene, camera, width, height, keypoint):
     y = (1.0 - float(cam_coord.y)) * height
     outside = cam_coord.x < 0.0 or cam_coord.x > 1.0 or cam_coord.y < 0.0 or cam_coord.y > 1.0 or cam_coord.z < 0.0
     return [x, y], "outside" if outside else ""
+
+
+def _capture_depth_pixels_cpu(context, camera):
+    scene = context.scene
+    width, height = effective_resolution(scene)
+    depsgraph = context.evaluated_depsgraph_get()
+    context.view_layer.update()
+
+    zbuffer = [float("inf")] * (width * height)
+    triangle_count = 0
+    sample_count = 0
+
+    for obj in scene.objects:
+        if not _is_renderable_mesh(obj, context.view_layer):
+            continue
+        eval_obj = obj.evaluated_get(depsgraph)
+        mesh = None
+        try:
+            mesh = eval_obj.to_mesh()
+            if mesh is None:
+                continue
+            mesh.calc_loop_triangles()
+            matrix = eval_obj.matrix_world
+            vertices = mesh.vertices
+            for tri in mesh.loop_triangles:
+                projected = []
+                skip = False
+                for vertex_index in tri.vertices:
+                    world = matrix @ vertices[vertex_index].co
+                    cam = world_to_camera_view(scene, camera, world)
+                    if cam.z <= 0.0:
+                        skip = True
+                        break
+                    projected.append((
+                        float(cam.x) * (width - 1),
+                        (1.0 - float(cam.y)) * (height - 1),
+                        float(cam.z),
+                    ))
+                if skip:
+                    continue
+                if _rasterize_depth_triangle(zbuffer, width, height, projected):
+                    triangle_count += 1
+        finally:
+            if mesh is not None:
+                eval_obj.to_mesh_clear()
+
+    finite = [value for value in zbuffer if value != float("inf")]
+    sample_count = len(finite)
+    rgba = [0.0] * (width * height * 4)
+    if finite:
+        near = min(finite)
+        far = max(finite)
+        span = max(far - near, 1.0e-8)
+        for y in range(height):
+            for x in range(width):
+                z = zbuffer[y * width + x]
+                internal_index = ((height - 1 - y) * width + x) * 4
+                if z == float("inf"):
+                    value = 0.0
+                else:
+                    value = 1.0 - ((z - near) / span)
+                    value = max(0.0, min(1.0, value))
+                rgba[internal_index:internal_index + 4] = [value, value, value, 1.0]
+    else:
+        near = None
+        far = None
+        for index in range(3, len(rgba), 4):
+            rgba[index] = 1.0
+
+    return rgba, {
+        "render_resolution": [width, height],
+        "depth_normalization": {
+            "mode": "camera_zbuffer_cpu",
+            "near": near,
+            "far": far,
+            "inverted": True,
+            "samples": sample_count,
+            "triangles": triangle_count,
+        },
+    }
+
+
+def _is_renderable_mesh(obj, view_layer):
+    if obj.type != "MESH" or obj.hide_render:
+        return False
+    try:
+        return bool(obj.visible_get(view_layer=view_layer))
+    except TypeError:
+        try:
+            return bool(obj.visible_get())
+        except Exception:
+            return True
+    except Exception:
+        return True
+
+
+def _rasterize_depth_triangle(zbuffer, width, height, tri):
+    (x0, y0, z0), (x1, y1, z1), (x2, y2, z2) = tri
+    min_x = max(0, int(min(x0, x1, x2)))
+    max_x = min(width - 1, int(max(x0, x1, x2)) + 1)
+    min_y = max(0, int(min(y0, y1, y2)))
+    max_y = min(height - 1, int(max(y0, y1, y2)) + 1)
+    if min_x > max_x or min_y > max_y:
+        return False
+
+    den = ((y1 - y2) * (x0 - x2)) + ((x2 - x1) * (y0 - y2))
+    if abs(den) < 1.0e-8:
+        return False
+
+    touched = False
+    eps = -1.0e-5
+    for y in range(min_y, max_y + 1):
+        py = y + 0.5
+        row = y * width
+        for x in range(min_x, max_x + 1):
+            px = x + 0.5
+            w0 = (((y1 - y2) * (px - x2)) + ((x2 - x1) * (py - y2))) / den
+            w1 = (((y2 - y0) * (px - x2)) + ((x0 - x2) * (py - y2))) / den
+            w2 = 1.0 - w0 - w1
+            if w0 < eps or w1 < eps or w2 < eps:
+                continue
+            z = (w0 * z0) + (w1 * z1) + (w2 * z2)
+            index = row + x
+            if z > 0.0 and z < zbuffer[index]:
+                zbuffer[index] = z
+                touched = True
+    return touched
+
+
+def _save_rgba_png(name, width, height, pixels, path):
+    image = bpy.data.images.new(name, width, height, alpha=True)
+    try:
+        try:
+            image.colorspace_settings.name = "Non-Color"
+        except Exception:
+            pass
+        image.pixels.foreach_set(pixels)
+        image.filepath_raw = path
+        image.file_format = "PNG"
+        image.save()
+    finally:
+        bpy.data.images.remove(image)
 
 
 def _temp_png_path(prefix):

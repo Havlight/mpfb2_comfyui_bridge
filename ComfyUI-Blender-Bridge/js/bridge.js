@@ -44,13 +44,33 @@ function comfyClass(node) {
 }
 
 
+function normalizeClassName(value) {
+	return String(value || "").replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+}
+
+
+function isOpenPoseClassName(value) {
+	return normalizeClassName(value) === "openposestudio";
+}
+
+
+function isImageReceiverClassName(value) {
+	return normalizeClassName(value) === "blenderbridgeimagereceiver";
+}
+
+
 function isOpenPoseStudioNode(node) {
-	return comfyClass(node) === "OpenPoseStudio";
+	return isOpenPoseClassName(comfyClass(node));
 }
 
 
 function isImageReceiverNode(node) {
-	return comfyClass(node) === "BlenderBridgeImageReceiver";
+	return isImageReceiverClassName(comfyClass(node));
+}
+
+
+function eventPayload(event) {
+	return event?.detail?.data || event?.detail || event?.data || {};
 }
 
 
@@ -108,6 +128,11 @@ function getWidget(node, name) {
 function widgetValue(node, name, fallback = "") {
 	const value = getWidget(node, name)?.value;
 	return value == null ? fallback : String(value);
+}
+
+
+function normalizedWidgetValue(node, name, fallback = "") {
+	return widgetValue(node, name, fallback).trim();
 }
 
 
@@ -259,35 +284,60 @@ function setImagePreviewState(node, payload, status = "received") {
 	if (!preview) {
 		return;
 	}
+	preview.payload = payload || {};
 	if (status === "received") {
-		preview.img.src = imagePreviewUrl(payload);
-		preview.img.style.display = "block";
-		preview.placeholder.style.display = "none";
 		const size = payload.width && payload.height ? `${payload.width}x${payload.height}` : "unknown size";
-		preview.meta.textContent = `${payload.channel || "image"} ${size} #${payload.update_id ?? "?"}`;
-		preview.meta.title = payload.hash || "";
+		const metaText = `${payload.channel || "image"} ${size} #${payload.update_id ?? "?"}`;
+		if (preview.kind === "dom") {
+			preview.img.style.display = "block";
+			preview.placeholder.style.display = "none";
+			preview.meta.textContent = metaText;
+			preview.meta.title = payload.hash || "";
+		} else {
+			preview.status = "";
+			preview.metaText = metaText;
+		}
 		preview.img.onload = () => {
 			void drawPoseOverlay(preview, payload);
+			app?.graph?.setDirtyCanvas?.(true, true);
 		};
+		preview.img.src = imagePreviewUrl(payload);
 		if (preview.img.complete) {
 			void drawPoseOverlay(preview, payload);
 		}
+		app?.graph?.setDirtyCanvas?.(true, true);
 		return;
 	}
 	preview.img.src = "";
-	preview.img.style.display = "none";
-	preview.placeholder.style.display = "flex";
-	preview.placeholder.textContent = status;
-	preview.meta.textContent = "";
+	if (preview.kind === "dom") {
+		preview.img.style.display = "none";
+		preview.placeholder.style.display = "flex";
+		preview.placeholder.textContent = status;
+		preview.meta.textContent = "";
+	} else {
+		preview.status = status;
+		preview.metaText = "";
+	}
 	clearOverlay(preview);
+	app?.graph?.setDirtyCanvas?.(true, true);
 }
 
 
 function ensureImagePreviewWidget(node) {
-	if (!node || node.__blenderBridgeImagePreview || typeof node.addDOMWidget !== "function") {
+	if (!node || node.__blenderBridgeImagePreview) {
 		return;
 	}
+	if (typeof node.addDOMWidget === "function") {
+		ensureDomImagePreviewWidget(node);
+	} else {
+		ensureCanvasImagePreviewWidget(node);
+	}
+	patchImageReceiverWidgets(node);
+	void refreshImagePreviewFromLatest(node);
+}
 
+
+function ensureDomImagePreviewWidget(node) {
 	const container = document.createElement("div");
 	container.className = "blender-bridge-image-preview";
 	container.style.cssText = [
@@ -349,7 +399,7 @@ function ensureImagePreviewWidget(node) {
 	container.appendChild(placeholder);
 	container.appendChild(meta);
 
-	node.__blenderBridgeImagePreview = { container, img, overlay, placeholder, meta };
+	node.__blenderBridgeImagePreview = { kind: "dom", container, img, overlay, placeholder, meta, payload: {} };
 	node.addDOMWidget("bridge_preview", "image", container, {
 		computeSize: () => [220, 180],
 		serialize: false,
@@ -359,6 +409,132 @@ function ensureImagePreviewWidget(node) {
 	targetSize[1] = Math.max(targetSize[1], 300);
 	node.setSize?.(targetSize);
 	setImagePreviewState(node, {}, "No image received");
+}
+
+
+function ensureCanvasImagePreviewWidget(node) {
+	const img = new Image();
+	node.__blenderBridgeImagePreview = {
+		kind: "canvas",
+		img,
+		status: "No image received",
+		metaText: "",
+		payload: {},
+	};
+
+	const previousDrawForeground = node.onDrawForeground;
+	node.onDrawForeground = function(ctx) {
+		if (previousDrawForeground) {
+			previousDrawForeground.apply(this, arguments);
+		}
+		drawCanvasImagePreview(this, ctx);
+	};
+	const targetSize = node.computeSize ? node.computeSize() : node.size || [260, 220];
+	targetSize[0] = Math.max(targetSize[0], 260);
+	targetSize[1] = Math.max(targetSize[1], 260);
+	node.setSize?.(targetSize);
+}
+
+
+function drawCanvasImagePreview(node, ctx) {
+	const preview = node?.__blenderBridgeImagePreview;
+	if (!preview || preview.kind !== "canvas" || !ctx) {
+		return;
+	}
+	const width = Math.max(1, Number(node.size?.[0]) || 260);
+	const height = Math.max(1, Number(node.size?.[1]) || 260);
+	const top = Math.max(88, height - 172);
+	const left = 10;
+	const boxW = Math.max(40, width - 20);
+	const boxH = Math.max(80, height - top - 12);
+
+	ctx.save();
+	ctx.fillStyle = "rgba(0,0,0,0.18)";
+	ctx.strokeStyle = "rgba(128,128,128,0.45)";
+	ctx.lineWidth = 1;
+	ctx.beginPath();
+	ctx.roundRect?.(left, top, boxW, boxH, 4);
+	if (!ctx.roundRect) {
+		ctx.rect(left, top, boxW, boxH);
+	}
+	ctx.fill();
+	ctx.stroke();
+
+	if (preview.img?.complete && preview.img.naturalWidth > 0) {
+		const fit = containRect(preview.img.naturalWidth, preview.img.naturalHeight, boxW, boxH);
+		ctx.drawImage(preview.img, left + fit.x, top + fit.y, fit.w, fit.h);
+	} else {
+		ctx.fillStyle = "#888";
+		ctx.font = "12px Arial";
+		ctx.textAlign = "center";
+		ctx.textBaseline = "middle";
+		ctx.fillText(preview.status || "Loading image...", left + boxW / 2, top + boxH / 2);
+	}
+
+	if (preview.metaText) {
+		ctx.fillStyle = "rgba(0,0,0,0.58)";
+		ctx.fillRect(left + 6, top + boxH - 22, boxW - 12, 17);
+		ctx.fillStyle = "#fff";
+		ctx.font = "11px Arial";
+		ctx.textAlign = "left";
+		ctx.textBaseline = "middle";
+		ctx.fillText(preview.metaText, left + 10, top + boxH - 13, boxW - 20);
+	}
+	ctx.restore();
+}
+
+
+function containRect(imageWidth, imageHeight, boxWidth, boxHeight) {
+	const scale = Math.min(boxWidth / imageWidth, boxHeight / imageHeight);
+	const w = imageWidth * scale;
+	const h = imageHeight * scale;
+	return {
+		x: (boxWidth - w) / 2,
+		y: (boxHeight - h) / 2,
+		w,
+		h,
+	};
+}
+
+
+function patchImageReceiverWidgets(node) {
+	if (!Array.isArray(node?.widgets) || node.__blenderBridgeWidgetCallbacksPatched) {
+		return;
+	}
+	node.__blenderBridgeWidgetCallbacksPatched = true;
+	for (const widget of node.widgets) {
+		if (!widget || !["source_id", "channel"].includes(widget.name)) {
+			continue;
+		}
+		const oldCallback = widget.callback;
+		widget.callback = function() {
+			const result = oldCallback ? oldCallback.apply(this, arguments) : undefined;
+			globalThis.setTimeout?.(() => refreshImagePreviewFromLatest(node), 0);
+			return result;
+		};
+	}
+}
+
+
+async function refreshImagePreviewFromLatest(node) {
+	if (!isImageReceiverNode(node)) {
+		return;
+	}
+	const source = encodeURIComponent(normalizedWidgetValue(node, "source_id", "blender") || "blender");
+	const channel = encodeURIComponent(normalizedWidgetValue(node, "channel", "beauty").toLowerCase() || "beauty");
+	try {
+		const response = await fetch(bridgeUrl(`/blender_bridge/latest?source_id=${source}&channel=${channel}`));
+		if (!response.ok) {
+			setImagePreviewState(node, {}, "No image received");
+			return;
+		}
+		const data = await response.json();
+		if (data?.metadata) {
+			setImagePreviewState(node, data.metadata);
+		}
+	} catch (_err) {
+		setImagePreviewState(node, {}, "Preview unavailable");
+	}
 }
 
 
@@ -453,9 +629,11 @@ function renderPoseOverlay(preview, pose) {
 
 
 function receiverMatchesPayload(node, payload) {
-	const sourceId = widgetValue(node, "source_id", "blender");
-	const channel = widgetValue(node, "channel", "beauty");
-	return sourceId === String(payload.source_id || "blender") && channel === String(payload.channel || "");
+	const sourceId = normalizedWidgetValue(node, "source_id", "blender") || "blender";
+	const channel = normalizedWidgetValue(node, "channel", "beauty").toLowerCase() || "beauty";
+	const payloadSource = String(payload.source_id || "blender").trim();
+	const payloadChannel = String(payload.channel || "").trim().toLowerCase();
+	return sourceId === payloadSource && channel === payloadChannel;
 }
 
 
@@ -503,15 +681,35 @@ app.registerExtension({
 			return;
 		}
 		apiObj.addEventListener("blender_bridge.pose", (event) => {
-			void applyPoseEvent(event.detail || {});
+			void applyPoseEvent(eventPayload(event));
 		});
 		apiObj.addEventListener("blender_bridge.image", (event) => {
-			applyImageEvent(event.detail || {});
+			applyImageEvent(eventPayload(event));
 		});
+		globalThis.setTimeout?.(() => {
+			for (const node of graphNodes()) {
+				if (isOpenPoseStudioNode(node)) {
+					ensureTargetId(node);
+				}
+				if (isImageReceiverNode(node)) {
+					ensureImagePreviewWidget(node);
+				}
+			}
+		}, 500);
+	},
+
+	loadedGraphNode(node) {
+		if (isOpenPoseStudioNode(node)) {
+			ensureTargetId(node);
+		}
+		if (isImageReceiverNode(node)) {
+			ensureImagePreviewWidget(node);
+		}
 	},
 
 	async beforeRegisterNodeDef(nodeType, nodeData) {
-		if (nodeData.name === "OpenPoseStudio" && !nodeType.prototype[OPENPOSE_PATCH_FLAG]) {
+		const className = nodeData?.name || nodeData?.display_name || nodeData?.title || "";
+		if (isOpenPoseClassName(className) && !nodeType.prototype[OPENPOSE_PATCH_FLAG]) {
 			nodeType.prototype[OPENPOSE_PATCH_FLAG] = true;
 
 			const onNodeCreated = nodeType.prototype.onNodeCreated;
@@ -548,7 +746,7 @@ app.registerExtension({
 			return;
 		}
 
-		if (nodeData.name === "BlenderBridgeImageReceiver" && !nodeType.prototype[IMAGE_PATCH_FLAG]) {
+		if (isImageReceiverClassName(className) && !nodeType.prototype[IMAGE_PATCH_FLAG]) {
 			nodeType.prototype[IMAGE_PATCH_FLAG] = true;
 			const onNodeCreated = nodeType.prototype.onNodeCreated;
 			nodeType.prototype.onNodeCreated = function() {
