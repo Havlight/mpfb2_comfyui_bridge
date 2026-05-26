@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+id = "mpfb_comfy_bridge"
+version = "0.1.0"
+name = "MPFB ComfyUI Bridge"
+tagline = "Send MPFB OpenPose and camera renders to ComfyUI"
+maintainer = "OpenAI"
+type = "add-on"
+tags = ["Render", "Pipeline"]
+blender_version_min = "4.5.0"
+license = [
+  "SPDX:MIT",
+]
+
+[permissions]
+files = "Create temporary PNG files for render transfer"
+network = "Send local OpenPose and render data to ComfyUI"
