@@ -12,5 +12,5 @@ license = [
 ]
 
 [permissions]
-files = "Create temporary PNG files for render transfer"
+files = "Create temporary PNG files for render transfer and optional local export files"
 network = "Send local OpenPose and render data to ComfyUI"

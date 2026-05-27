@@ -99,10 +99,40 @@ The Blender addon provides:
 - `Send Beauty`: send the normal Blender render.
 - `Send Depth`: send a camera depth map.
 - `Send All`: send pose, beauty, and depth as one batch.
+- `Save local after send`: save manual sends to a local folder.
+- `Save Folder`: fixed export folder used by local save.
 - `Auto Pose Sync`: periodically sends pose only.
 - `Pause when Studio editor is open`: avoids overwriting active OpenPose Studio editor changes during auto sync.
 
 Auto sync can overwrite OpenPose Studio edits. Keep the pause option enabled when editing poses manually.
+
+## Local Save
+
+The Blender addon can save a local copy of manually sent data. Enable `Save local after send` and choose `Save Folder` once; future manual sends use that folder without asking again.
+
+Default folder:
+
+```text
+//mpfb_comfy_bridge_exports
+```
+
+This is a Blender-relative path. If the current `.blend` file has not been saved yet, the addon falls back to Blender's temp directory:
+
+```text
+<blender temp>/mpfb_comfy_bridge_exports
+```
+
+Saved filenames use one timestamp plus the channel name:
+
+```text
+YYYYMMDD_HHMMSS_microseconds_pose.json
+YYYYMMDD_HHMMSS_microseconds_beauty.png
+YYYYMMDD_HHMMSS_microseconds_depth.png
+```
+
+`Send All` writes pose, beauty, and depth with the same timestamp prefix so they can be matched as one capture set. If a filename already exists, the addon appends `_001`, `_002`, and so on.
+
+Local save applies only to manual `Send Pose`, `Send Beauty`, `Send Depth`, and `Send All`. Auto Pose Sync does not save local files. If local save fails, the addon shows a warning but still queues the ComfyUI send.
 
 ## ComfyUI Nodes
 
@@ -286,7 +316,7 @@ py -3 -m py_compile .\ComfyUI-Blender-Bridge\bridge_state.py .\ComfyUI-Blender-B
 With Blender 4.5 installed in the default Windows location:
 
 ```powershell
-& 'C:\Program Files\Blender Foundation\Blender 4.5\4.5\python\bin\python.exe' -m py_compile .\mpfb_comfy_bridge\capture.py .\mpfb_comfy_bridge\ui.py .\mpfb_comfy_bridge\http_queue.py
+& 'C:\Program Files\Blender Foundation\Blender 4.5\4.5\python\bin\python.exe' -m py_compile .\mpfb_comfy_bridge\capture.py .\mpfb_comfy_bridge\ui.py .\mpfb_comfy_bridge\http_queue.py .\mpfb_comfy_bridge\local_save.py
 ```
 
 The ComfyUI node pack also includes Python tests under:
@@ -318,6 +348,7 @@ mpfb2_comfyui_bridge/
     __init__.py
     capture.py
     http_queue.py
+    local_save.py
     mpfb_runtime.py
     ui.py
 ```

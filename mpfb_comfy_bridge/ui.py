@@ -7,6 +7,7 @@ import bpy
 
 from . import capture
 from . import http_queue
+from . import local_save
 from . import mpfb_runtime
 
 
@@ -97,6 +98,15 @@ class MPFBComfyBridgeProperties(bpy.types.PropertyGroup):
         name="Pause when Studio editor is open",
         default=True,
     )
+    save_local_after_send: bpy.props.BoolProperty(
+        name="Save local after send",
+        default=False,
+    )
+    local_save_dir: bpy.props.StringProperty(
+        name="Save Folder",
+        default=local_save.DEFAULT_SAVE_DIR,
+        subtype="DIR_PATH",
+    )
     status: bpy.props.StringProperty(
         name="Status",
         default="Idle",
@@ -147,10 +157,14 @@ class _SendBase:
         }
         return metadata
 
-    def _queue_pose(self, context, props, camera, batch_id=None, expected=None, auto_sync=False):
+    def _queue_pose(self, context, props, camera, batch_id=None, expected=None, auto_sync=False, timestamp=None):
         pose, pose_meta = capture.capture_pose_payload(context, camera, include_hands=props.include_hands)
         metadata = self._metadata(context, props, camera, batch_id, expected, auto_sync)
         metadata.update(pose_meta)
+        if not auto_sync:
+            save_warning = self._save_pose_local(props, pose, timestamp)
+            if save_warning:
+                metadata["local_save_warning"] = save_warning
         payload = {
             "source_id": props.source_id.strip() or "blender",
             "pose_json": pose,
@@ -164,9 +178,12 @@ class _SendBase:
         )
         return pose, metadata
 
-    def _queue_image(self, props, camera, channel, image_bytes, metadata):
+    def _queue_image(self, props, camera, channel, image_bytes, metadata, timestamp=None):
         metadata = dict(metadata)
         metadata["camera_name"] = camera.name
+        save_warning = self._save_image_local(props, timestamp, channel, image_bytes)
+        if save_warning:
+            metadata["local_save_warning"] = save_warning
         http_queue.enqueue_image(
             props.comfy_url,
             props.token,
@@ -176,6 +193,40 @@ class _SendBase:
             metadata,
             f"Send {channel}",
         )
+        return save_warning
+
+    def _save_pose_local(self, props, pose, timestamp=None):
+        if not props.save_local_after_send:
+            return ""
+        try:
+            local_save.write_pose_json(props.local_save_dir, timestamp or local_save.make_timestamp(), pose)
+            return ""
+        except Exception as exc:
+            return f"Local save failed: {exc}"
+
+    def _save_image_local(self, props, timestamp, channel, image_bytes):
+        if not props.save_local_after_send:
+            return ""
+        try:
+            local_save.write_png(props.local_save_dir, timestamp or local_save.make_timestamp(), channel, image_bytes)
+            return ""
+        except Exception as exc:
+            return f"Local save failed: {exc}"
+
+    def _set_warning(self, props, warning):
+        props.last_error = warning or ""
+        if warning:
+            self.report({"WARNING"}, warning)
+
+    def _warning_from_metadata(self, metadata):
+        warnings = []
+        projection = metadata.get("projection_warning", "")
+        local_warning = metadata.get("local_save_warning", "")
+        if projection:
+            warnings.append(projection)
+        if local_warning:
+            warnings.append(local_warning)
+        return " | ".join(warnings)
 
 
 class MPFBCOMFYBRIDGE_OT_SendPose(_SendBase, bpy.types.Operator):
@@ -191,9 +242,7 @@ class MPFBCOMFYBRIDGE_OT_SendPose(_SendBase, bpy.types.Operator):
                 _pose, metadata = self._queue_pose(context, props, camera)
             props.status = "Pose queued"
             props.last_sent = _stamp("pose")
-            props.last_error = metadata.get("projection_warning", "")
-            if props.last_error:
-                self.report({"WARNING"}, props.last_error)
+            self._set_warning(props, self._warning_from_metadata(metadata))
         except Exception as exc:
             props.status = "Pose failed"
             props.last_error = str(exc)
@@ -213,10 +262,10 @@ class MPFBCOMFYBRIDGE_OT_SendBeauty(_SendBase, bpy.types.Operator):
             with capture.RenderBorderGuard(context.scene):
                 metadata = self._metadata(context, props, camera, expected=["beauty"])
                 image = capture.capture_beauty_png(context, camera)
-            self._queue_image(props, camera, "beauty", image, metadata)
+            save_warning = self._queue_image(props, camera, "beauty", image, metadata)
             props.status = "Beauty queued"
             props.last_sent = _stamp("beauty")
-            props.last_error = ""
+            self._set_warning(props, save_warning)
         except Exception as exc:
             props.status = "Beauty failed"
             props.last_error = str(exc)
@@ -237,10 +286,10 @@ class MPFBCOMFYBRIDGE_OT_SendDepth(_SendBase, bpy.types.Operator):
                 metadata = self._metadata(context, props, camera, expected=["depth"])
                 image, depth_meta = capture.capture_depth_png(context, camera)
                 metadata.update(depth_meta)
-            self._queue_image(props, camera, "depth", image, metadata)
+            save_warning = self._queue_image(props, camera, "depth", image, metadata)
             props.status = "Depth queued"
             props.last_sent = _stamp("depth")
-            props.last_error = ""
+            self._set_warning(props, save_warning)
         except Exception as exc:
             props.status = "Depth failed"
             props.last_error = str(exc)
@@ -259,22 +308,22 @@ class MPFBCOMFYBRIDGE_OT_SendAll(_SendBase, bpy.types.Operator):
         expected = ["pose", "beauty", "depth"]
         try:
             camera = self._camera(context, props)
+            save_timestamp = local_save.make_timestamp()
             with capture.RenderBorderGuard(context.scene):
-                _pose, pose_metadata = self._queue_pose(context, props, camera, batch_id, expected)
+                _pose, pose_metadata = self._queue_pose(context, props, camera, batch_id, expected, False, save_timestamp)
 
                 beauty_metadata = self._metadata(context, props, camera, batch_id, expected)
                 beauty = capture.capture_beauty_png(context, camera)
-                self._queue_image(props, camera, "beauty", beauty, beauty_metadata)
+                beauty_warning = self._queue_image(props, camera, "beauty", beauty, beauty_metadata, save_timestamp)
 
                 depth_metadata = self._metadata(context, props, camera, batch_id, expected)
                 depth, depth_meta = capture.capture_depth_png(context, camera)
                 depth_metadata.update(depth_meta)
-                self._queue_image(props, camera, "depth", depth, depth_metadata)
+                depth_warning = self._queue_image(props, camera, "depth", depth, depth_metadata, save_timestamp)
             props.status = "Pose, beauty and depth queued"
             props.last_sent = _stamp("all")
-            props.last_error = pose_metadata.get("projection_warning", "")
-            if props.last_error:
-                self.report({"WARNING"}, props.last_error)
+            warnings = [self._warning_from_metadata(pose_metadata), beauty_warning, depth_warning]
+            self._set_warning(props, " | ".join([warning for warning in warnings if warning]))
         except Exception as exc:
             props.status = "Send all failed"
             props.last_error = str(exc)
@@ -322,6 +371,11 @@ class MPFBCOMFYBRIDGE_PT_Panel(bpy.types.Panel):
         row.operator("mpfb_comfy_bridge.send_all", icon="EXPORT")
         if props.last_sent:
             send.label(text=props.last_sent)
+
+        local = layout.box()
+        local.label(text="Local Save")
+        local.prop(props, "save_local_after_send")
+        local.prop(props, "local_save_dir")
 
         auto = layout.box()
         auto.label(text="Auto Sync")
